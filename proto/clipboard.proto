@@ -1,0 +1,56 @@
+syntax = "proto3";
+
+package clipboard.v1;
+
+option go_package = "github.com/gokulvs/dclip/gen/clipboard/v1";
+
+service ClipboardService {
+  // Push clipboard content to this node (from a peer)
+  rpc Push(PushRequest) returns (PushResponse);
+  // Pull the current clipboard content from this node
+  rpc Pull(PullRequest) returns (PullResponse);
+  // Subscribe to clipboard changes from this node (server-streaming)
+  rpc Subscribe(SubscribeRequest) returns (stream ClipboardEvent);
+}
+
+enum ContentType {
+  CONTENT_TYPE_UNSPECIFIED = 0;
+  CONTENT_TYPE_TEXT = 1;
+  CONTENT_TYPE_FILE = 2;
+  CONTENT_TYPE_IMAGE = 3;
+}
+
+message ClipboardContent {
+  ContentType type = 1;
+  bytes data = 2;
+  // Original filename, used when type is FILE
+  string filename = 3;
+  // MIME type, used for images (e.g. "image/png")
+  string mime_type = 4;
+  // UUID of the node that originated this content
+  string sender_id = 5;
+  // Unix nanoseconds timestamp
+  int64 timestamp = 6;
+}
+
+message PushRequest {
+  ClipboardContent content = 1;
+}
+
+message PushResponse {
+  bool accepted = 1;
+}
+
+message PullRequest {}
+
+message PullResponse {
+  ClipboardContent content = 1;
+}
+
+message SubscribeRequest {
+  string subscriber_id = 1;
+}
+
+message ClipboardEvent {
+  ClipboardContent content = 1;
+}
