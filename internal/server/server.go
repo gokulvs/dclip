@@ -18,6 +18,10 @@ type Server struct {
 	mu      sync.RWMutex
 	current *pb.ClipboardContent
 
+	// pushNotify delivers content received via the Push RPC to the local node
+	// so it can apply the change to the system clipboard.
+	pushNotify chan *pb.ClipboardContent
+
 	// subscribers is a map of subscriber ID -> channel of events
 	subsMu      sync.Mutex
 	subscribers map[string]chan *pb.ClipboardEvent
@@ -26,12 +30,19 @@ type Server struct {
 // New creates a new Server.
 func New() *Server {
 	return &Server{
+		pushNotify:  make(chan *pb.ClipboardContent, 32),
 		subscribers: make(map[string]chan *pb.ClipboardEvent),
 	}
 }
 
-// Push receives clipboard content from a peer and stores it locally,
-// then fans it out to all subscribers.
+// IncomingPushes returns the channel that receives every Push from a remote peer.
+// The node reads from this channel to write incoming content to the local clipboard.
+func (s *Server) IncomingPushes() <-chan *pb.ClipboardContent {
+	return s.pushNotify
+}
+
+// Push receives clipboard content from a peer, stores it, notifies the local
+// node (via pushNotify), and fans out to any Subscribe stream subscribers.
 func (s *Server) Push(ctx context.Context, req *pb.PushRequest) (*pb.PushResponse, error) {
 	if req.Content == nil {
 		return nil, status.Error(codes.InvalidArgument, "content is required")
@@ -41,15 +52,19 @@ func (s *Server) Push(ctx context.Context, req *pb.PushRequest) (*pb.PushRespons
 	s.current = req.Content
 	s.mu.Unlock()
 
-	// Notify all subscribers (non-blocking).
+	// Deliver to the local node (non-blocking — node may be slow).
+	select {
+	case s.pushNotify <- req.Content:
+	default:
+	}
+
+	// Also fan out to any Subscribe-stream subscribers.
 	event := &pb.ClipboardEvent{Content: req.Content}
 	s.subsMu.Lock()
-	for id, ch := range s.subscribers {
+	for _, ch := range s.subscribers {
 		select {
 		case ch <- event:
 		default:
-			// Subscriber is slow — drop the event rather than block.
-			_ = id
 		}
 	}
 	s.subsMu.Unlock()
@@ -67,6 +82,8 @@ func (s *Server) Pull(ctx context.Context, _ *pb.PullRequest) (*pb.PullResponse,
 
 // Subscribe opens a server-streaming RPC that pushes clipboard events to the
 // subscriber as they arrive.
+// On connect it immediately sends the current clipboard so a rejoining peer
+// is brought up to date without waiting for the next copy event.
 func (s *Server) Subscribe(req *pb.SubscribeRequest, stream pb.ClipboardService_SubscribeServer) error {
 	id := req.SubscriberId
 	ch := make(chan *pb.ClipboardEvent, 16)
@@ -80,6 +97,17 @@ func (s *Server) Subscribe(req *pb.SubscribeRequest, stream pb.ClipboardService_
 		delete(s.subscribers, id)
 		s.subsMu.Unlock()
 	}()
+
+	// Initial sync: send whatever we currently hold so the subscriber is
+	// immediately up-to-date (handles peer restart / late join).
+	s.mu.RLock()
+	current := s.current
+	s.mu.RUnlock()
+	if current != nil {
+		if err := stream.Send(&pb.ClipboardEvent{Content: current}); err != nil {
+			return err
+		}
+	}
 
 	for {
 		select {
@@ -96,8 +124,7 @@ func (s *Server) Subscribe(req *pb.SubscribeRequest, stream pb.ClipboardService_
 	}
 }
 
-// Broadcast pushes content directly (used by the local node to propagate its
-// own clipboard changes without going through gRPC).
+// Broadcast pushes locally-originated content to all Subscribe-stream subscribers.
 func (s *Server) Broadcast(content *pb.ClipboardContent) {
 	content.Timestamp = time.Now().UnixNano()
 

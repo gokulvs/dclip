@@ -103,3 +103,13 @@ make proto
 ```
 
 Requires `protoc`, `protoc-gen-go`, and `protoc-gen-go-grpc` on `$PATH`.
+
+## Wdinows machines firewall changes
+### Run as Administrator
+```bash
+New-NetFirewallRule -DisplayName "dclip mDNS" -Direction Inbound `
+  -Protocol UDP -LocalPort 5353 -Action Allow
+New-NetFirewallRule -DisplayName "dclip gRPC" -Direction Inbound `
+  -Protocol TCP -LocalPort 9090 -Action Allow
+
+```

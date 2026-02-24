@@ -8,6 +8,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"syscall"
+	"time"
 
 	"github.com/gokulvs/dclip/internal/node"
 	"github.com/spf13/cobra"
@@ -15,8 +16,14 @@ import (
 
 var (
 	port    int
-	verbose bool
+	connect []string // manual peer addresses
 )
+
+func init() {
+	// Always log to stdout with a clean format (no date prefix clutter).
+	log.SetOutput(os.Stdout)
+	log.SetFlags(log.Ltime)
+}
 
 func main() {
 	root := &cobra.Command{
@@ -25,11 +32,15 @@ func main() {
 		Long: `dclip syncs your clipboard across machines on the same local network.
 
 Run "dclip start" on each machine. Anything you copy is automatically
-propagated to all peers discovered via mDNS.`,
+propagated to all peers discovered via mDNS (Bonjour/Avahi).
+
+If mDNS is blocked by a firewall, specify peers manually:
+  dclip start --connect 192.168.1.42:9090`,
 	}
 
 	root.PersistentFlags().IntVarP(&port, "port", "p", 9090, "gRPC listen port (0 = random)")
-	root.PersistentFlags().BoolVarP(&verbose, "verbose", "v", false, "verbose logging")
+	root.PersistentFlags().StringArrayVarP(&connect, "connect", "c", nil,
+		"manually connect to peer at host:port (repeatable, bypasses mDNS)")
 
 	root.AddCommand(
 		startCmd(),
@@ -48,17 +59,26 @@ func startCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "start",
 		Short: "Start the dclip daemon (blocks until interrupted)",
+		Example: `  dclip start
+  dclip start --port 9191
+  dclip start --connect 192.168.1.42:9090`,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			if !verbose {
-				log.SetOutput(os.Stdout)
-			}
+			n := node.New(port, connect...)
 
-			n := node.New(port)
 			ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 			defer cancel()
 
-			fmt.Printf("dclip starting — node %s\n", n.ID())
-			fmt.Println("Clipboard changes will be synced automatically. Press Ctrl-C to stop.")
+			fmt.Printf("dclip node %s  port=%d\n", n.ID(), port)
+			if len(connect) > 0 {
+				for _, c := range connect {
+					fmt.Printf("  seed peer: %s\n", c)
+				}
+			} else {
+				fmt.Println("  peer discovery: mDNS (auto)")
+				fmt.Println("  tip: if peers are not found, use --connect <ip:port>")
+			}
+			fmt.Println("Press Ctrl-C to stop.")
+			fmt.Println()
 
 			return n.Start(ctx)
 		},
@@ -75,13 +95,11 @@ func pushCmd() *cobra.Command {
 		Example: `  dclip push "hello world"
   dclip push -f /path/to/image.png`,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			n := node.New(port)
+			n := node.New(port, connect...)
 			ctx, cancel := context.WithCancel(context.Background())
 			defer cancel()
 
-			// Start the node in the background so peer connections are established.
-			errCh := make(chan error, 1)
-			go func() { errCh <- n.Start(ctx) }()
+			go func() { _ = n.Start(ctx) }()
 
 			if filePath != "" {
 				data, err := os.ReadFile(filePath)
@@ -112,32 +130,32 @@ func pullCmd() *cobra.Command {
 		Use:   "pull",
 		Short: "Pull the current clipboard from a peer",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			fmt.Println("pull: not yet implemented (use 'start' for automatic sync)")
+			fmt.Println("pull: not yet implemented — use 'start' for automatic sync")
 			return nil
 		},
 	}
 }
 
-// peersCmd lists currently connected peers (requires a running daemon).
+// peersCmd scans and lists discovered peers.
 func peersCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "peers",
-		Short: "List discovered peers on the local network",
+		Short: "Scan and list peers on the local network",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			n := node.New(port)
+			n := node.New(port, connect...)
 			ctx, cancel := context.WithCancel(context.Background())
 			defer cancel()
 
 			go func() { _ = n.Start(ctx) }()
 
-			// Give mDNS a moment to discover peers.
-			fmt.Println("Scanning for peers (3 s)…")
+			fmt.Println("Scanning for 5 s… (Ctrl-C to stop early)")
 
 			sigCh := make(chan os.Signal, 1)
 			signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 
 			select {
 			case <-sigCh:
+			case <-time.After(5 * time.Second):
 			}
 
 			peers := n.Peers()
