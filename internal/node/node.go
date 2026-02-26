@@ -19,7 +19,6 @@ import (
 	cliputil "github.com/gokulvs/dclip/internal/clipboard"
 	"github.com/gokulvs/dclip/internal/discovery"
 	"github.com/gokulvs/dclip/internal/server"
-	xclip "golang.design/x/clipboard"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 )
@@ -70,8 +69,8 @@ func (n *Node) Port() int { return n.port }
 // Start launches the gRPC server, mDNS registration, peer discovery loop,
 // and local clipboard monitor. It blocks until ctx is cancelled.
 func (n *Node) Start(ctx context.Context) error {
-	// Initialise the system clipboard (required by golang.design/x/clipboard).
-	if err := xclip.Init(); err != nil {
+	// Initialise the system clipboard.
+	if err := cliputil.Init(); err != nil {
 		return fmt.Errorf("clipboard init: %w", err)
 	}
 
@@ -391,9 +390,9 @@ func (n *Node) applyRemoteContent(c *pb.ClipboardContent) {
 
 	switch c.Type {
 	case pb.ContentType_CONTENT_TYPE_TEXT:
-		xclip.Write(xclip.FmtText, c.Data)
+		cliputil.WriteText(c.Data)
 	case pb.ContentType_CONTENT_TYPE_IMAGE:
-		xclip.Write(xclip.FmtImage, c.Data)
+		cliputil.WriteImage(c.Data)
 	case pb.ContentType_CONTENT_TYPE_FILE:
 		path, err := cliputil.WriteFile(c.Filename, c.Data)
 		if err != nil {
@@ -401,15 +400,15 @@ func (n *Node) applyRemoteContent(c *pb.ClipboardContent) {
 		} else {
 			log.Printf("[node] file saved to %s", path)
 			// Put the saved path in the text clipboard so the user can paste it.
-			xclip.Write(xclip.FmtText, []byte(path))
+			cliputil.WriteText([]byte(path))
 		}
 	}
 }
 
 // watchLocalClipboard monitors the system clipboard and pushes changes to peers.
 func (n *Node) watchLocalClipboard(ctx context.Context) {
-	textCh := xclip.Watch(ctx, xclip.FmtText)
-	imgCh := xclip.Watch(ctx, xclip.FmtImage)
+	textCh := cliputil.WatchText(ctx)
+	imgCh := cliputil.WatchImage(ctx)
 
 	if textCh == nil && imgCh == nil {
 		log.Printf("[node] WARNING: clipboard Watch returned nil channels — local changes will not be detected")
