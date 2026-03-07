@@ -4,14 +4,18 @@ package clipboard
 
 // Clipboard watch and read/write for macOS using direct NSPasteboard calls.
 //
-// golang.design/x/clipboard v0.7.1 crashes on modern macOS (SIGTRAP inside
-// clipboard_read_string) because its CGO layer calls AppKit APIs that trigger
-// a thread-safety assertion when invoked from a Go goroutine.
+// Two layers of protection against NSPasteboard crashes on modern macOS:
 //
-// Our approach — polling changeCount + reading stringForType/dataForType from
-// a background goroutine — is safe: NSPasteboard read operations are
-// thread-safe on macOS 10.15+ and we avoid the complex Cocoa machinery the
-// external library uses.
+//  1. pasteMu (pastelock_darwin.go) — Go-level mutex that ensures only one
+//     goroutine enters an NSPasteboard CGO call at a time.  Without this,
+//     three concurrent pollers (WatchText, WatchImage, WatchFiles) each run
+//     on their own OS thread, causing SIGSEGV from simultaneous C calls.
+//
+//  2. @try/@catch in every C helper — NSPasteboard can throw NSGenericException
+//     ("collection mutated while being enumerated") when a distributed
+//     notification arrives mid-call and mutates its internal type cache.
+//     The exception is caught; the helper returns NULL/0 and the next 300 ms
+//     poll retries automatically.
 
 // #cgo CFLAGS: -x objective-c
 // #cgo LDFLAGS: -framework AppKit
@@ -19,52 +23,69 @@ package clipboard
 // #import <AppKit/AppKit.h>
 //
 // static long cb_change_count() {
-//     return [NSPasteboard generalPasteboard].changeCount;
+//     @try {
+//         return [NSPasteboard generalPasteboard].changeCount;
+//     } @catch (NSException *e) {
+//         return -2; // distinct from -1 sentinel; won't match lastCount
+//     }
 // }
 //
 // // Returns a heap-allocated UTF-8 string when the clipboard contains plain
 // // text, otherwise NULL. Caller must free().
 // static char* cb_get_string() {
-//     NSString *s = [[NSPasteboard generalPasteboard]
-//                         stringForType:NSPasteboardTypeString];
-//     if (!s) return NULL;
-//     return strdup([s UTF8String]);
+//     @try {
+//         NSString *s = [[NSPasteboard generalPasteboard]
+//                             stringForType:NSPasteboardTypeString];
+//         if (!s) return NULL;
+//         return strdup([s UTF8String]);
+//     } @catch (NSException *e) {
+//         return NULL;
+//     }
 // }
 //
 // static void cb_set_string(const char *s) {
-//     NSPasteboard *pb = [NSPasteboard generalPasteboard];
-//     [pb clearContents];
-//     [pb setString:[NSString stringWithUTF8String:s]
-//           forType:NSPasteboardTypeString];
+//     @try {
+//         NSPasteboard *pb = [NSPasteboard generalPasteboard];
+//         [pb clearContents];
+//         [pb setString:[NSString stringWithUTF8String:s]
+//               forType:NSPasteboardTypeString];
+//     } @catch (NSException *e) {}
 // }
 //
 // // Returns heap-allocated PNG bytes when the clipboard contains an image,
 // // otherwise NULL. Caller must free().
 // static void* cb_get_image(int *len) {
-//     NSPasteboard *pb = [NSPasteboard generalPasteboard];
-//     NSData *data = [pb dataForType:NSPasteboardTypePNG];
-//     if (!data) {
-//         // Fall back: convert TIFF → PNG (macOS screenshots are TIFF).
-//         NSData *tiff = [pb dataForType:NSPasteboardTypeTIFF];
-//         if (tiff) {
-//             NSBitmapImageRep *rep = [NSBitmapImageRep imageRepWithData:tiff];
-//             if (rep)
-//                 data = [rep representationUsingType:NSBitmapImageFileTypePNG
-//                                         properties:@{}];
+//     @try {
+//         NSPasteboard *pb = [NSPasteboard generalPasteboard];
+//         NSData *data = [pb dataForType:NSPasteboardTypePNG];
+//         if (!data) {
+//             // Fall back: convert TIFF → PNG (macOS screenshots are TIFF).
+//             NSData *tiff = [pb dataForType:NSPasteboardTypeTIFF];
+//             if (tiff) {
+//                 NSBitmapImageRep *rep = [NSBitmapImageRep imageRepWithData:tiff];
+//                 if (rep)
+//                     data = [rep representationUsingType:NSBitmapImageFileTypePNG
+//                                             properties:@{}];
+//             }
 //         }
+//         if (!data || [data length] == 0) { *len = 0; return NULL; }
+//         *len = (int)[data length];
+//         void *result = malloc(*len);
+//         memcpy(result, [data bytes], *len);
+//         return result;
+//     } @catch (NSException *e) {
+//         *len = 0;
+//         return NULL;
 //     }
-//     if (!data || [data length] == 0) { *len = 0; return NULL; }
-//     *len = (int)[data length];
-//     void *result = malloc(*len);
-//     memcpy(result, [data bytes], *len);
-//     return result;
 // }
 //
 // static void cb_set_image(const void *data, int len) {
-//     NSData *d = [NSData dataWithBytes:data length:len];
-//     NSPasteboard *pb = [NSPasteboard generalPasteboard];
-//     [pb clearContents];
-//     [pb setData:d forType:NSPasteboardTypePNG];
+//     @try {
+//         NSData *d = [NSData dataWithBytes:data length:len];
+//         NSPasteboard *pb = [NSPasteboard generalPasteboard];
+//         [pb clearContents];
+//         [pb setData:d forType:NSPasteboardTypePNG];
+//     } @catch (NSException *e) {}
 // }
 import "C"
 
@@ -93,17 +114,23 @@ func WatchText(ctx context.Context) <-chan []byte {
 			case <-ctx.Done():
 				return
 			case <-t.C:
+				// Hold pasteMu for the entire count-check + read cycle so no
+				// other goroutine can touch NSPasteboard at the same time.
+				pasteMu.Lock()
 				cur := C.cb_change_count()
 				if cur == lastCount {
+					pasteMu.Unlock()
 					continue
 				}
 				lastCount = cur
 				raw := C.cb_get_string()
-				if raw == nil {
-					continue
+				var data []byte
+				if raw != nil {
+					data = []byte(C.GoString(raw))
+					C.free(unsafe.Pointer(raw))
 				}
-				data := []byte(C.GoString(raw))
-				C.free(unsafe.Pointer(raw))
+				pasteMu.Unlock()
+
 				if len(data) == 0 {
 					continue
 				}
@@ -132,18 +159,25 @@ func WatchImage(ctx context.Context) <-chan []byte {
 			case <-ctx.Done():
 				return
 			case <-t.C:
+				pasteMu.Lock()
 				cur := C.cb_change_count()
 				if cur == lastCount {
+					pasteMu.Unlock()
 					continue
 				}
 				lastCount = cur
 				var n C.int
-				data := C.cb_get_image(&n)
-				if data == nil || n == 0 {
+				imgData := C.cb_get_image(&n)
+				var b []byte
+				if imgData != nil && n > 0 {
+					b = C.GoBytes(imgData, n)
+					C.free(imgData)
+				}
+				pasteMu.Unlock()
+
+				if len(b) == 0 {
 					continue
 				}
-				b := C.GoBytes(data, n)
-				C.free(data)
 				select {
 				case ch <- b:
 				case <-ctx.Done():
@@ -158,8 +192,10 @@ func WatchImage(ctx context.Context) <-chan []byte {
 // WriteText writes plain text to the macOS clipboard.
 func WriteText(data []byte) {
 	cs := C.CString(string(data))
-	defer C.free(unsafe.Pointer(cs))
+	pasteMu.Lock()
 	C.cb_set_string(cs)
+	pasteMu.Unlock()
+	C.free(unsafe.Pointer(cs))
 }
 
 // WriteImage writes PNG image bytes to the macOS clipboard.
@@ -167,5 +203,7 @@ func WriteImage(data []byte) {
 	if len(data) == 0 {
 		return
 	}
+	pasteMu.Lock()
 	C.cb_set_image(unsafe.Pointer(&data[0]), C.int(len(data)))
+	pasteMu.Unlock()
 }

@@ -4,6 +4,8 @@ package clipboard
 
 // Use the modern NSPasteboard API to detect file copies from Finder.
 // NSPasteboard.changeCount lets us poll efficiently without spawning processes.
+// All CGO calls are wrapped with pasteMu (pastelock_darwin.go) to prevent
+// concurrent access, and with @try/@catch to survive internal Apple exceptions.
 
 // #cgo CFLAGS: -x objective-c
 // #cgo LDFLAGS: -framework AppKit
@@ -11,22 +13,31 @@ package clipboard
 // #import <AppKit/AppKit.h>
 //
 // static long pbChangeCount() {
-//     return [NSPasteboard generalPasteboard].changeCount;
+//     @try {
+//         return [NSPasteboard generalPasteboard].changeCount;
+//     } @catch (NSException *e) {
+//         return -2;
+//     }
 // }
 //
 // // Returns heap-allocated array of strdup'd UTF-8 paths for files in the
 // // clipboard. Caller must free with freeFilePaths().
 // static char** pbFilePaths(int *count) {
-//     NSPasteboard *pb = [NSPasteboard generalPasteboard];
-//     NSDictionary *opts = @{ NSPasteboardURLReadingFileURLsOnlyKey: @YES };
-//     NSArray *urls = [pb readObjectsForClasses:@[[NSURL class]] options:opts];
-//     if (!urls || [urls count] == 0) { *count = 0; return NULL; }
-//     *count = (int)[urls count];
-//     char **result = (char **)malloc(*count * sizeof(char *));
-//     for (int i = 0; i < *count; i++) {
-//         result[i] = strdup([[(NSURL *)urls[i] path] UTF8String]);
+//     @try {
+//         NSPasteboard *pb = [NSPasteboard generalPasteboard];
+//         NSDictionary *opts = @{ NSPasteboardURLReadingFileURLsOnlyKey: @YES };
+//         NSArray *urls = [pb readObjectsForClasses:@[[NSURL class]] options:opts];
+//         if (!urls || [urls count] == 0) { *count = 0; return NULL; }
+//         *count = (int)[urls count];
+//         char **result = (char **)malloc(*count * sizeof(char *));
+//         for (int i = 0; i < *count; i++) {
+//             result[i] = strdup([[(NSURL *)urls[i] path] UTF8String]);
+//         }
+//         return result;
+//     } @catch (NSException *e) {
+//         *count = 0;
+//         return NULL;
 //     }
-//     return result;
 // }
 //
 // static void freeFilePaths(char **paths, int count) {
@@ -57,12 +68,16 @@ func WatchFiles(ctx context.Context) <-chan []string {
 			case <-ctx.Done():
 				return
 			case <-t.C:
+				// Read changeCount under lock; release before Go work.
+				pasteMu.Lock()
 				cur := C.pbChangeCount()
+				pasteMu.Unlock()
+
 				if cur == lastCount {
 					continue
 				}
 				lastCount = cur
-				paths := darwinFilePaths()
+				paths := darwinFilePaths() // acquires pasteMu internally
 				if len(paths) == 0 {
 					continue
 				}
@@ -77,19 +92,28 @@ func WatchFiles(ctx context.Context) <-chan []string {
 	return ch
 }
 
+// darwinFilePaths reads file URLs from NSPasteboard under pasteMu and returns
+// only paths that exist on disk. Callers must NOT hold pasteMu.
 func darwinFilePaths() []string {
+	pasteMu.Lock()
 	var n C.int
 	raw := C.pbFilePaths(&n)
-	if raw == nil || n == 0 {
-		return nil
+	count := int(n)
+	// Copy C strings into Go memory before releasing the lock.
+	var cstrs []string
+	if raw != nil && count > 0 {
+		cArr := (*[1 << 20]*C.char)(unsafe.Pointer(raw))[:count:count]
+		cstrs = make([]string, count)
+		for i, cp := range cArr {
+			cstrs[i] = C.GoString(cp)
+		}
+		C.freeFilePaths(raw, n)
 	}
-	defer C.freeFilePaths(raw, n)
+	pasteMu.Unlock()
 
-	cnt := int(n)
-	cArr := (*[1 << 20]*C.char)(unsafe.Pointer(raw))[:cnt:cnt]
-	paths := make([]string, 0, cnt)
-	for _, cp := range cArr {
-		p := C.GoString(cp)
+	// os.Stat does not touch NSPasteboard — safe outside the lock.
+	paths := make([]string, 0, len(cstrs))
+	for _, p := range cstrs {
 		if _, err := os.Stat(p); err == nil {
 			paths = append(paths, p)
 		}
