@@ -20,11 +20,17 @@ jobs:
       with:
         go-version: '1.24'
 
-    - name: Build (native)
+    - name: Build (native macOS)
       run: go build -v ./...
 
     - name: Build Windows amd64
       run: CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -v -o /dev/null ./cmd/dclip
+
+    - name: Install Linux amd64 cross-compiler
+      run: brew install FiloSottile/musl-cross/musl-cross
+
+    - name: Build Linux amd64
+      run: CGO_ENABLED=1 GOOS=linux GOARCH=amd64 CC=x86_64-linux-musl-gcc go build -v -o /dev/null ./cmd/dclip
 
     - name: Test
       run: go test -v ./...
@@ -45,8 +51,17 @@ jobs:
       with:
         go-version: '1.24'
 
+    - name: Install Linux cross-compilers
+      run: |
+        # x86_64-linux-musl-gcc — used for linux-amd64
+        brew install FiloSottile/musl-cross/musl-cross
+        # aarch64-unknown-linux-musl-gcc — used for linux-arm64
+        brew install messense/macos-cross-toolchains/aarch64-unknown-linux-musl
+
     - name: Build all platform binaries
-      run: make dist
+      # Override LINUX_CC_ARM64 because the messense toolchain names the binary
+      # aarch64-unknown-linux-musl-gcc (not aarch64-linux-musl-gcc).
+      run: make dist LINUX_CC_ARM64=aarch64-unknown-linux-musl-gcc
 
     - name: Create GitHub release and upload binaries
       uses: softprops/action-gh-release@v2
