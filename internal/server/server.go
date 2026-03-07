@@ -124,6 +124,14 @@ func (s *Server) Subscribe(req *pb.SubscribeRequest, stream pb.ClipboardService_
 	}
 }
 
+// SubscriberCount returns the number of peers currently subscribed to this node.
+func (s *Server) SubscriberCount() int {
+	s.subsMu.Lock()
+	n := len(s.subscribers)
+	s.subsMu.Unlock()
+	return n
+}
+
 // Broadcast pushes locally-originated content to all Subscribe-stream subscribers.
 func (s *Server) Broadcast(content *pb.ClipboardContent) {
 	content.Timestamp = time.Now().UnixNano()

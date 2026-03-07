@@ -200,40 +200,69 @@ func (n *Node) handleDiscoveredPeers(ctx context.Context, peers <-chan discovery
 // dialPeer tries each address advertised by a peer (in order) and connects to
 // the first one that succeeds. This handles Windows machines that advertise
 // multiple IPs including non-routable virtual adapters (Hyper-V, WSL2, VPN).
+// If all addresses fail it retries with backoff up to ~2 minutes so transient
+// issues (firewall, peer still starting up) self-heal without waiting for the
+// next mDNS re-announce cycle.
 func (n *Node) dialPeer(ctx context.Context, p discovery.Peer) {
-	addrs := p.Addrs()
-	for i, addr := range addrs {
-		log.Printf("[node] trying peer %s address %d/%d: %s", p.ID[:8], i+1, len(addrs), addr)
+	backoff := 10 * time.Second
+	const maxBackoff = 60 * time.Second
 
-		conn, err := grpc.NewClient(addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
-		if err != nil {
-			log.Printf("[node] address %s: NewClient error: %v", addr, err)
-			continue
+	for {
+		if ctx.Err() != nil {
+			return
 		}
 
-		// Probe connectivity with a real RPC.
-		probeCtx, probeCancel := context.WithTimeout(ctx, 5*time.Second)
-		_, err = pb.NewClipboardServiceClient(conn).Pull(probeCtx, &pb.PullRequest{})
-		probeCancel()
-		if err != nil {
-			conn.Close()
-			log.Printf("[node] address %s unreachable: %v", addr, err)
-			continue
+		// Bail out if another goroutine already connected this peer.
+		n.peersMu.RLock()
+		_, exists := n.peers[p.ID]
+		n.peersMu.RUnlock()
+		if exists {
+			return
 		}
 
-		// Connected — hand off to the subscription loop.
-		pCtx, cancel := context.WithCancel(ctx)
-		pc := &peerConn{id: p.ID, addr: addr, conn: conn, cancel: cancel}
+		addrs := p.Addrs()
+		for i, addr := range addrs {
+			log.Printf("[node] trying peer %s address %d/%d: %s", p.ID[:8], i+1, len(addrs), addr)
 
-		n.peersMu.Lock()
-		n.peers[p.ID] = pc
-		n.peersMu.Unlock()
+			conn, err := grpc.NewClient(addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+			if err != nil {
+				log.Printf("[node] address %s: NewClient error: %v", addr, err)
+				continue
+			}
 
-		log.Printf("[node] connected to peer %s via %s", p.ID[:8], addr)
-		n.subscribeToPeer(pCtx, pc)
-		return
+			// Probe connectivity with a real RPC.
+			probeCtx, probeCancel := context.WithTimeout(ctx, 5*time.Second)
+			_, err = pb.NewClipboardServiceClient(conn).Pull(probeCtx, &pb.PullRequest{})
+			probeCancel()
+			if err != nil {
+				conn.Close()
+				log.Printf("[node] address %s unreachable: %v", addr, err)
+				continue
+			}
+
+			// Connected — hand off to the subscription loop.
+			pCtx, cancel := context.WithCancel(ctx)
+			pc := &peerConn{id: p.ID, addr: addr, conn: conn, cancel: cancel}
+
+			n.peersMu.Lock()
+			n.peers[p.ID] = pc
+			n.peersMu.Unlock()
+
+			log.Printf("[node] connected to peer %s via %s", p.ID[:8], addr)
+			n.subscribeToPeer(pCtx, pc)
+			return
+		}
+
+		log.Printf("[node] peer %s unreachable — retrying in %v", p.ID[:8], backoff)
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(backoff):
+		}
+		if backoff < maxBackoff {
+			backoff *= 2
+		}
 	}
-	log.Printf("[node] peer %s unreachable on all %d address(es)", p.ID[:8], len(addrs))
 }
 
 // dialAddr dials a seed peer by address and keeps reconnecting indefinitely
@@ -565,10 +594,14 @@ func (n *Node) pushToPeers(ctx context.Context, content *pb.ClipboardContent) {
 	}
 }
 
+// peerCount returns the total number of connected peers: both outbound
+// connections (peers we dialed) and inbound subscribers (peers that called
+// Subscribe on our gRPC server).
 func (n *Node) peerCount() int {
 	n.peersMu.RLock()
-	defer n.peersMu.RUnlock()
-	return len(n.peers)
+	out := len(n.peers)
+	n.peersMu.RUnlock()
+	return out + n.srv.SubscriberCount()
 }
 
 // heartbeat logs a periodic status line so the user knows the node is alive.
