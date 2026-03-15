@@ -7,8 +7,14 @@ DIST     := dist
 VERSION  := $(shell git describe --tags --always --dirty 2>/dev/null || echo "dev")
 LDFLAGS  := -ldflags "-X main.version=$(VERSION) -s -w"
 
+# Cross-compilers used when building Linux targets from macOS.
+# Install via: brew install FiloSottile/musl-cross/musl-cross
+LINUX_CC_AMD64  ?= x86_64-linux-musl-gcc
+LINUX_CC_ARM64  ?= aarch64-linux-musl-gcc
+
 .PHONY: all build dist \
         build-mac-arm64 build-mac-amd64 \
+        build-linux-amd64 build-linux-arm64 \
         build-windows-amd64 build-windows-arm64 \
         install proto clean
 
@@ -21,7 +27,9 @@ build:
 ## Build release binaries for all platforms into ./dist/
 dist:
 	@mkdir -p $(DIST)
-	@$(MAKE) build-mac-arm64 build-mac-amd64 build-windows-amd64 build-windows-arm64
+	@$(MAKE) build-mac-arm64 build-mac-amd64 \
+	         build-linux-amd64 build-linux-arm64 \
+	         build-windows-amd64 build-windows-arm64
 	@echo ""
 	@echo "Release binaries:"
 	@ls -lh $(DIST)/
@@ -42,6 +50,25 @@ build-mac-amd64:
 	CGO_ENABLED=1 GOOS=darwin GOARCH=amd64 \
 	go build $(LDFLAGS) -o $(DIST)/$(BINARY)-darwin-amd64 $(CMD)
 	@echo "built $(DIST)/$(BINARY)-darwin-amd64"
+
+# ── Linux ─────────────────────────────────────────────────────────────────────
+# golang.design/x/clipboard uses CGO + X11 on Linux.
+# Native (on a Linux host):  CC is picked up automatically; no override needed.
+# Cross (from macOS):        requires musl-cross or gnu-cross toolchain.
+#   brew install FiloSottile/musl-cross/musl-cross
+# Override the compiler via: make build-linux-amd64 LINUX_CC_AMD64=x86_64-linux-gnu-gcc
+
+build-linux-amd64:
+	@mkdir -p $(DIST)
+	CGO_ENABLED=1 GOOS=linux GOARCH=amd64 CC=$(LINUX_CC_AMD64) \
+	go build $(LDFLAGS) -o $(DIST)/$(BINARY)-linux-amd64 $(CMD)
+	@echo "built $(DIST)/$(BINARY)-linux-amd64"
+
+build-linux-arm64:
+	@mkdir -p $(DIST)
+	CGO_ENABLED=1 GOOS=linux GOARCH=arm64 CC=$(LINUX_CC_ARM64) \
+	go build $(LDFLAGS) -o $(DIST)/$(BINARY)-linux-arm64 $(CMD)
+	@echo "built $(DIST)/$(BINARY)-linux-arm64"
 
 # ── Windows ───────────────────────────────────────────────────────────────────
 # golang.design/x/clipboard uses pure Windows syscalls — no CGO needed.
